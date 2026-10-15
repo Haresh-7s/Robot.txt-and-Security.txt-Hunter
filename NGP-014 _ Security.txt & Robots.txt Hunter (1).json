@@ -1,0 +1,696 @@
+{
+  "name": "NGP-014 | Security.txt & Robots.txt Hunter",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "a7257761-ff91-4abf-97f2-b946b8c0efcc",
+      "name": "Start Recon",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        352,
+        -128
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "cfg-t1",
+              "name": "target_1",
+              "value": "http://testhtml5.vulnweb.com",
+              "type": "string"
+            },
+            {
+              "id": "cfg-t2",
+              "name": "target_2",
+              "value": "https://example.com",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "fd1238d8-5546-48fd-b7ec-e21e8610b1d0",
+      "name": "Target Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        272,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize the two configurable targets (authorized targets only).\nconst cfg = $input.first().json;\nconst out = [];\nfor (const key of ['target_1', 'target_2']) {\n  let raw = String(cfg[key] || '').trim();\n  if (!raw) continue;\n  if (!/^https?:\\/\\//i.test(raw)) raw = 'http://' + raw;\n  raw = raw.replace(/\\/+$/, '');\n  out.push({ json: { slot: key, target: raw } });\n}\nreturn out;"
+      },
+      "id": "0123bd29-32de-4d76-89e1-1ac0f924075a",
+      "name": "Build Targets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.target }}/robots.txt",
+        "options": {
+          "redirect": {
+            "redirect": {
+              "maxRedirects": 3
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 10000
+        }
+      },
+      "id": "addee923-bb04-4b79-9bd7-ba76a66823ec",
+      "name": "Fetch robots.txt",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        624,
+        -112
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Build Targets').all()[$itemIndex].json.target }}/.well-known/security.txt",
+        "options": {
+          "redirect": {
+            "redirect": {
+              "maxRedirects": 3
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 10000
+        }
+      },
+      "id": "4921cb07-f718-4794-8b12-3317f1333f41",
+      "name": "Fetch security.txt",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        816,
+        -112
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse robots.txt Disallow entries and classify security.txt. No discovered path is ever requested.\nconst targets = $('Build Targets').all();\nconst robotsItems = $('Fetch robots.txt').all();\nconst secItems = $('Fetch security.txt').all();\nconst KEYWORDS = ['admin', 'backup', 'config', '.git', 'test'];\n\nfunction errText(j) {\n  if (!j || !j.error) return null;\n  const e = j.error;\n  const t = typeof e === 'string' ? e : (e.message || e.description || JSON.stringify(e));\n  return String(t).slice(0, 300);\n}\nfunction bodyOf(j) {\n  if (!j) return '';\n  const b = j.data !== undefined ? j.data : j.body;\n  if (b === undefined || b === null) return '';\n  return typeof b === 'string' ? b : JSON.stringify(b);\n}\nfunction statusOf(j) {\n  if (!j) return null;\n  const s = j.statusCode !== undefined ? j.statusCode : j.status;\n  return typeof s === 'number' ? s : (s ? Number(s) : null);\n}\nconst looksHtml = (s) => /^\\s*<(!doctype|html)/i.test(s);\n\nconst out = [];\nfor (let i = 0; i < targets.length; i++) {\n  const target = targets[i].json.target;\n  const rj = (robotsItems[i] || {}).json || {};\n  const sj = (secItems[i] || {}).json || {};\n  const fetchedAt = new Date().toISOString();\n\n  // robots.txt\n  const rErr = errText(rj);\n  const rStatus = statusOf(rj);\n  const rBody = bodyOf(rj);\n  let robotsState = 'unknown';\n  if (rErr) robotsState = 'inaccessible';\n  else if (rStatus === 200 && !looksHtml(rBody)) robotsState = 'ok';\n  else if (rStatus === 200) robotsState = 'unknown';\n  else if (rStatus === 404 || rStatus === 410) robotsState = 'missing';\n  else if (rStatus) robotsState = 'inaccessible';\n\n  const candidates = [];\n  let disallowCount = 0;\n  if (robotsState === 'ok') {\n    const seen = {};\n    for (const line of rBody.split(/\\r?\\n/)) {\n      const clean = line.split('#')[0].trim();\n      const m = clean.match(/^disallow\\s*:\\s*(.*)$/i);\n      if (!m) continue;\n      const path = m[1].trim();\n      if (!path) continue;\n      disallowCount++;\n      const low = path.toLowerCase();\n      const hits = KEYWORDS.filter((k) => low.includes(k));\n      if (hits.length && !seen[path] && candidates.length < 40) {\n        seen[path] = true;\n        candidates.push({ path: path, keywords: hits });\n      }\n    }\n  }\n\n  // security.txt\n  const sErr = errText(sj);\n  const sStatus = statusOf(sj);\n  const sBody = bodyOf(sj);\n  let secStatus = 'unknown';\n  let warning = '';\n  if (sErr) {\n    secStatus = 'inaccessible';\n    warning = 'WARNING: security.txt could not be retrieved (' + sErr + '). Not proof of a vulnerability.';\n  } else if (sStatus === 200) {\n    if (/^\\s*contact\\s*:/im.test(sBody) && !looksHtml(sBody)) {\n      secStatus = 'present';\n    } else {\n      secStatus = 'unknown';\n      warning = 'WARNING: HTTP 200 but content has no Contact field (possible soft-404/HTML page). Status unclear.';\n    }\n  } else if (sStatus === 404 || sStatus === 410) {\n    secStatus = 'missing';\n    warning = 'WARNING: security.txt is missing (HTTP ' + sStatus + '). No published disclosure contact; a hygiene gap, not proof of a vulnerability.';\n  } else if (sStatus) {\n    secStatus = 'inaccessible';\n    warning = 'WARNING: security.txt returned HTTP ' + sStatus + ' (access error). Not proof of a vulnerability.';\n  } else {\n    warning = 'WARNING: security.txt status could not be determined.';\n  }\n\n  const robots = {\n    httpStatus: rStatus,\n    state: robotsState,\n    error: rErr,\n    disallowCount: disallowCount,\n    excerpt: rBody.slice(0, 3000),\n  };\n  const securityTxt = { status: secStatus, httpStatus: sStatus, warning: warning };\n  const agentInput = JSON.stringify({\n    task: 'NGP-014',\n    target: target,\n    fetchedAt: fetchedAt,\n    robotsTxt: robots,\n    securityTxt: securityTxt,\n    candidatePaths: candidates,\n  });\n  out.push({ json: { target: target, robots: robots, securityTxt: securityTxt, candidates: candidates, agentInput: agentInput } });\n}\nreturn out;"
+      },
+      "id": "12c5563c-9936-4371-bb21-9b0168aaf7f8",
+      "name": "Normalize & Analyze",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        112
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Analyze this reconnaissance input for ONE authorized target and return the required JSON.\nINPUT:\n{{ $json.agentInput }}",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "You are a red-team web reconnaissance analyst working on an AUTHORIZED, non-invasive engagement (task tag NGP-014).\nMANDATORY: before answering you MUST call the tool fetch_public_file at least once with file=\"robots.txt\" to independently re-verify the target robots.txt. You should also call parse_disallow_paths with the raw robots.txt text to cross-check matches. You may call fetch_public_file with file=\".well-known/security.txt\" to confirm its status.\nNEVER request any discovered Disallow path and never probe or exploit anything; the tools only fetch those two public files.\nRank up to 6 paths (only paths that appear in the verified robots.txt Disallow list AND contain admin, backup, config, .git or test, case-insensitive) by how interesting they would be to a bug hunter. Give each a rank (1 = most interesting), a short reason, and an informational severity of Info, Low or Medium. A path in robots.txt is only a reconnaissance lead - never claim a vulnerability exists. Return fewer than 6 if fewer match, or an empty list if none. Report securityTxt status as exactly one of present|missing|inaccessible|unknown with the HTTP status and a clear warning text when it is not present (a missing file is a hygiene gap, not proof of a vulnerability). Set tag to NGP-014, include exactly one entry in targets for the given target, a short summary, and verdict INFO, LOW or MEDIUM (the highest severity you assigned; INFO if none). Use only facts supported by the actual HTTP responses. TOOL BUDGET: call each tool at most twice in total. If fetch_public_file errors or times out, do NOT retry more than once; treat that file as inaccessible, rely on the provided INPUT, and give your final JSON answer immediately.",
+          "maxIterations": 12,
+          "returnIntermediateSteps": true,
+          "forceToolCallOnFirstIteration": true
+        }
+      },
+      "id": "6642a5eb-c4b0-4838-8ac6-4ffa86bf9eac",
+      "name": "Recon Ranking Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        960,
+        -176
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "gpt-5.4-mini",
+          "cachedResultName": "gpt-5.4-mini"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "id": "bded5601-3f7c-4c61-b488-e62570ee3a88",
+      "name": "OpenAI Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        880,
+        224
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": null,
+          "name": "Gateway credits",
+          "__aiGatewayManaged": true
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Normalize & Analyze').item.json.target }}/{{ $fromAI('file', 'Exactly one of: robots.txt or .well-known/security.txt', 'string') }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 20000
+        },
+        "optimizeResponse": true,
+        "responseType": "text",
+        "truncateResponse": true,
+        "maxLength": 4000
+      },
+      "id": "ca8804b1-c5ae-4e1e-9512-cc5e7fa56317",
+      "name": "fetch_public_file",
+      "type": "n8n-nodes-base.httpRequestTool",
+      "typeVersion": 4.5,
+      "position": [
+        1040,
+        224
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "description": "Parses raw robots.txt text (pass the full text as the input) and returns JSON listing Disallow paths that contain admin, backup, config, .git or test. Use it to cross-check the candidate list. It never requests any path.",
+        "jsCode": "const text = String(query || '');\nconst KEYWORDS = ['admin', 'backup', 'config', '.git', 'test'];\nconst found = [];\nconst seen = {};\nfor (const line of text.split(/\\r?\\n/)) {\n  const clean = line.split('#')[0].trim();\n  const m = clean.match(/^disallow\\s*:\\s*(.*)$/i);\n  if (!m) continue;\n  const path = m[1].trim();\n  if (!path || seen[path]) continue;\n  const low = path.toLowerCase();\n  const hits = KEYWORDS.filter((k) => low.includes(k));\n  if (hits.length) { seen[path] = true; found.push({ path: path, keywords: hits }); }\n}\nreturn JSON.stringify({ matches: found, count: found.length });"
+      },
+      "id": "c903eac6-b247-42fc-8790-f3c5ee8397dd",
+      "name": "parse_disallow_paths",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1.3,
+      "position": [
+        880,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "jsonSchemaExample": "{\"tag\":\"NGP-014\",\"targets\":[{\"target\":\"https://example.com\",\"securityTxt\":{\"status\":\"missing\",\"httpStatus\":404,\"warning\":\"security.txt is missing (HTTP 404); not proof of a vulnerability.\"},\"rankedTop6\":[{\"rank\":1,\"path\":\"/admin/\",\"reason\":\"Admin area listed in robots.txt; worth manual scoping review.\",\"severity\":\"Info\"}]}],\"summary\":\"Short overall summary\",\"verdict\":\"INFO\"}"
+      },
+      "id": "42933343-27d4-42a6-a48b-18cce94fdfc9",
+      "name": "Structured Recon Output",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        1056,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "SpBSRO7HM6sX0Syt",
+          "cachedResultName": "ngp014_audit_log"
+        },
+        "limit": 1,
+        "orderBy": true
+      },
+      "id": "6417f9c8-c180-46ed-b941-cec305bcbd65",
+      "name": "Get Last Audit Row",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1280,
+        -176
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// SHA-256 of the exact AI input + hash-chained audit record (each row embeds the previous row hash).\nconst crypto = require('crypto');\nconst sha = (s) => crypto.createHash('sha256').update(String(s), 'utf8').digest('hex');\nconst agentItems = $('Recon Ranking Agent').all();\nconst normItems = $('Normalize & Analyze').all();\nconst last = $input.first().json || {};\nlet prev = last.record_sha256 ? String(last.record_sha256) : 'GENESIS';\nconst execId = String($execution.id);\nconst MODEL = 'gpt-5.4-mini';\nconst SEV = ['Info', 'Low', 'Medium'];\nconst V = ['INFO', 'LOW', 'MEDIUM'];\nconst rows = [];\n\nfor (let i = 0; i < normItems.length; i++) {\n  const n = normItems[i].json;\n  const a = (agentItems[i] || {}).json || {};\n  const now = $now;\n  const tsUtc = now.toUTC().toISO();\n  const tsIst = now.setZone('Asia/Kolkata').toFormat('yyyy-LL-dd HH:mm:ss') + ' IST';\n\n  let raw = a.output;\n  const failed = !!a.error || raw === undefined || raw === null;\n  if (typeof raw === 'string') { try { raw = JSON.parse(raw); } catch (e) { /* keep string */ } }\n  const modelOutput = failed ? JSON.stringify({ error: a.error || 'no output' }) : (typeof raw === 'string' ? raw : JSON.stringify(raw));\n\n  const steps = Array.isArray(a.intermediateSteps) ? a.intermediateSteps : [];\n  const toolNames = steps.map((s) => (s.action && s.action.tool) || 'unknown');\n  const toolArgs = JSON.stringify(steps.map((s) => (s.action && s.action.toolInput) || {})).slice(0, 2000);\n  const toolSummary = steps.map((s) => String(typeof s.observation === 'string' ? s.observation : JSON.stringify(s.observation)).slice(0, 300)).join(' || ').slice(0, 1500);\n  const toolUsed = steps.length > 0;\n\n  // Sanitize: keep only paths really present in the fetched robots.txt candidate list.\n  const allowed = {};\n  for (const c of n.candidates) allowed[c.path] = true;\n  let ranked = [];\n  let dropped = 0;\n  const parsed = (!failed && raw && typeof raw === 'object') ? raw : null;\n  const entry = parsed && Array.isArray(parsed.targets) ? (parsed.targets[0] || {}) : {};\n  const aiRanked = Array.isArray(entry.rankedTop6) ? entry.rankedTop6 : [];\n  for (const r of aiRanked) {\n    if (!r || !allowed[r.path]) { dropped++; continue; }\n    if (ranked.find((x) => x.path === r.path)) continue;\n    ranked.push({ path: r.path, reason: String(r.reason || '').slice(0, 300), severity: SEV.includes(r.severity) ? r.severity : 'Info' });\n  }\n  ranked = ranked.slice(0, 6).map((r, idx) => ({ rank: idx + 1, path: r.path, reason: r.reason, severity: r.severity }));\n\n  let maxSev = 0;\n  for (const r of ranked) maxSev = Math.max(maxSev, SEV.indexOf(r.severity));\n  const aiVerdict = parsed && V.includes(String(parsed.verdict).toUpperCase()) ? String(parsed.verdict).toUpperCase() : null;\n  const verdict = aiVerdict || V[maxSev];\n  const summary = parsed && parsed.summary ? String(parsed.summary).slice(0, 300) : (failed ? 'AI analysis failed' : 'No summary');\n  const status = failed ? 'AGENT_ERROR' : (toolUsed ? 'OK' : 'TOOL_NOT_CALLED');\n\n  const inputHash = sha(n.agentInput);\n  const fields = [prev, 'NGP-014', execId, n.target, inputHash, tsUtc, tsIst, modelOutput, verdict, verdict, toolNames.join(','), toolArgs, toolSummary, status];\n  const recordHash = sha(fields.join('|'));\n\n  rows.push({ json: {\n    seq_key: execId + '-' + (i + 1),\n    task_tag: 'NGP-014',\n    execution_id: execId,\n    target_url: n.target,\n    canonical_input: n.agentInput,\n    input_sha256: inputHash,\n    timestamp_utc: tsUtc,\n    timestamp_ist: tsIst,\n    model_name: MODEL,\n    model_output: modelOutput,\n    verdict: verdict,\n    severity: verdict,\n    tool_name: toolNames.join(','),\n    tool_arguments: toolArgs,\n    tool_result_summary: toolSummary,\n    workflow_status: status,\n    prev_record_sha256: prev,\n    record_sha256: recordHash,\n    view: { target: n.target, securityTxt: n.securityTxt, ranked: ranked, dropped: dropped, summary: summary, verdict: verdict, status: status },\n  } });\n  prev = recordHash;\n}\nreturn rows;"
+      },
+      "id": "648d0f6f-8bd8-4e76-95a7-95d827396c51",
+      "name": "Build Audit Records",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1280,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "dataTableId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "SpBSRO7HM6sX0Syt",
+          "cachedResultName": "ngp014_audit_log"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "seq_key": "={{ $json.seq_key }}",
+            "task_tag": "={{ $json.task_tag }}",
+            "execution_id": "={{ $json.execution_id }}",
+            "target_url": "={{ $json.target_url }}",
+            "canonical_input": "={{ $json.canonical_input }}",
+            "input_sha256": "={{ $json.input_sha256 }}",
+            "timestamp_utc": "={{ $json.timestamp_utc }}",
+            "timestamp_ist": "={{ $json.timestamp_ist }}",
+            "model_name": "={{ $json.model_name }}",
+            "model_output": "={{ $json.model_output }}",
+            "verdict": "={{ $json.verdict }}",
+            "severity": "={{ $json.severity }}",
+            "tool_name": "={{ $json.tool_name }}",
+            "tool_arguments": "={{ $json.tool_arguments }}",
+            "tool_result_summary": "={{ $json.tool_result_summary }}",
+            "workflow_status": "={{ $json.workflow_status }}",
+            "prev_record_sha256": "={{ $json.prev_record_sha256 }}",
+            "record_sha256": "={{ $json.record_sha256 }}"
+          },
+          "schema": [
+            {
+              "id": "seq_key",
+              "displayName": "seq_key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "task_tag",
+              "displayName": "task_tag",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "execution_id",
+              "displayName": "execution_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "target_url",
+              "displayName": "target_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "canonical_input",
+              "displayName": "canonical_input",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "input_sha256",
+              "displayName": "input_sha256",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "timestamp_utc",
+              "displayName": "timestamp_utc",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "timestamp_ist",
+              "displayName": "timestamp_ist",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "model_name",
+              "displayName": "model_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "model_output",
+              "displayName": "model_output",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "verdict",
+              "displayName": "verdict",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "severity",
+              "displayName": "severity",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tool_name",
+              "displayName": "tool_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tool_arguments",
+              "displayName": "tool_arguments",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "tool_result_summary",
+              "displayName": "tool_result_summary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "workflow_status",
+              "displayName": "workflow_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "prev_record_sha256",
+              "displayName": "prev_record_sha256",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "record_sha256",
+              "displayName": "record_sha256",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a36a2c7f-af6d-4df4-99de-33bc748841ec",
+      "name": "Store Audit Rows",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1248,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $('Build Audit Records').all().map((i) => i.json);\nconst esc = (s) => String(s === undefined || s === null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst V = ['INFO', 'LOW', 'MEDIUM'];\nlet maxV = 0;\nlet leads = 0;\nlet notPresent = 0;\nfor (const r of rows) {\n  maxV = Math.max(maxV, V.indexOf(r.view.verdict));\n  leads += r.view.ranked.length;\n  if (r.view.securityTxt.status !== 'present') notPresent++;\n}\nconst verdict = V[Math.max(maxV, 0)];\nconst first = rows[0] || { execution_id: String($execution.id), timestamp_ist: '' };\nconst oneLine = rows.length + ' targets, ' + leads + ' ranked leads, security.txt not present on ' + notPresent;\nconst lines = [];\nlines.push('\\uD83D\\uDD34 NGP-014 | exec #' + first.execution_id + ' | ' + first.timestamp_ist + ' | ' + verdict + ' | ' + oneLine);\nfor (const r of rows) {\n  const v = r.view;\n  lines.push('');\n  lines.push('<b>Target:</b> ' + esc(v.target));\n  const st = v.securityTxt;\n  lines.push('security.txt: <b>' + esc(String(st.status).toUpperCase()) + '</b>' + (st.httpStatus ? ' (HTTP ' + st.httpStatus + ')' : ''));\n  if (st.status !== 'present' && st.warning) lines.push(esc(st.warning));\n  lines.push('Verdict: ' + esc(v.verdict) + (v.status !== 'OK' ? ' [' + esc(v.status) + ']' : ''));\n  if (v.ranked.length) {\n    lines.push('Top leads (recon only):');\n    for (const x of v.ranked) lines.push(x.rank + '. ' + esc(x.path) + ' [' + esc(x.severity) + '] ' + esc(x.reason));\n  } else {\n    lines.push('Top leads: none matched admin/backup/config/.git/test');\n  }\n  lines.push('Input SHA-256: <code>' + esc(r.input_sha256) + '</code>');\n  lines.push('Record SHA-256: <code>' + esc(r.record_sha256) + '</code>');\n}\nlines.push('');\nlines.push('Leads are reconnaissance hints only; no discovered path was visited.');\nreturn [{ json: { message: lines.join(String.fromCharCode(10)) } }];"
+      },
+      "id": "1553add0-5c26-44db-b174-323f489724d4",
+      "name": "Format Telegram Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1552,
+        -160
+      ],
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "chatId": "2116950707",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "ddd4c16d-323f-4806-a409-e7b892ca6207",
+      "name": "Send Telegram Report",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1584,
+        192
+      ],
+      "executeOnce": true,
+      "webhookId": "04679053-8bdd-48b2-968f-12d35dca4401",
+      "credentials": {
+        "telegramApi": {
+          "id": "M5IqI7D3UoKvhP9z",
+          "name": "Telegram account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Start Recon": {
+      "main": [
+        [
+          {
+            "node": "Target Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Target Config": {
+      "main": [
+        [
+          {
+            "node": "Build Targets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Targets": {
+      "main": [
+        [
+          {
+            "node": "Fetch robots.txt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch robots.txt": {
+      "main": [
+        [
+          {
+            "node": "Fetch security.txt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch security.txt": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Analyze",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & Analyze": {
+      "main": [
+        [
+          {
+            "node": "Recon Ranking Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recon Ranking Agent": {
+      "main": [
+        [
+          {
+            "node": "Get Last Audit Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Recon Ranking Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "fetch_public_file": {
+      "ai_tool": [
+        [
+          {
+            "node": "Recon Ranking Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "parse_disallow_paths": {
+      "ai_tool": [
+        [
+          {
+            "node": "Recon Ranking Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structured Recon Output": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Recon Ranking Agent",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Last Audit Row": {
+      "main": [
+        [
+          {
+            "node": "Build Audit Records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Audit Records": {
+      "main": [
+        [
+          {
+            "node": "Store Audit Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Audit Rows": {
+      "main": [
+        [
+          {
+            "node": "Format Telegram Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Telegram Message": {
+      "main": [
+        [
+          {
+            "node": "Send Telegram Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "ea816fbd-0353-4733-b3fb-9c60e682ead9",
+  "meta": {
+    "instanceId": "fa780238ef8aefde74594dc3c6be12d2d154c3a8493567b9bb5d57b3a0bf9698"
+  },
+  "nodeGroups": [],
+  "id": "EZDH8B9D89unC8uV",
+  "tags": []
+}
